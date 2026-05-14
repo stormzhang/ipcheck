@@ -36,6 +36,12 @@
 pip install ipcheck
 ```
 
+升级到最新版：
+
+```bash
+pip install --upgrade ipcheck
+```
+
 ## 使用
 
 ```bash

@@ -347,6 +347,11 @@ def get_cli_tz_name():
 
 # ── 主程序 ────────────────────────────────────────────────
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ('--version', '-v', '-V'):
+        from ipcheck import __version__
+        print(f"ipcheck {__version__}")
+        return
+
     pub = get_public_info()
 
     print(f"\n  {C.BOLD}ipcheck — 网络环境诊断工具{C.RESET}  "
