@@ -116,7 +116,6 @@ class C:
     RED    = "\033[91m" if _COLOR else ""
     GREEN  = "\033[92m" if _COLOR else ""
     YELLOW = "\033[93m" if _COLOR else ""
-    CYAN   = "\033[96m" if _COLOR else ""
     GRAY   = "\033[90m" if _COLOR else ""
 
 ANSI_RE = re.compile(r'\033\[[0-9;]*m')
@@ -142,6 +141,14 @@ def warn(v): return f"{C.YELLOW}{v}{C.RESET}"
 def bad(v):  return f"{C.RED}{v}{C.RESET}"
 
 
+def risk_color(score):
+    if score < 30:
+        return C.GREEN, "低风险"
+    if score < 70:
+        return C.YELLOW, "中风险"
+    return C.RED, "高风险"
+
+
 # ── 表格渲染 ──────────────────────────────────────────────
 COL_LABEL, COL_VALUE = 18, 46
 
@@ -161,26 +168,23 @@ def tbl_row(label, value):
 # ── 数据采集 ─────────────────────────────────────────────
 def get_lan_ip():
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
     except Exception:
         return warn("获取失败")
 
 
 def get_ipv6():
     try:
-        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-        s.connect(("2001:4860:4860::8888", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        if ip and ip not in ('', '::'):
-            return ip
+        with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as s:
+            s.connect(("2001:4860:4860::8888", 80))
+            ip = s.getsockname()[0]
+            if ip and ip not in ('', '::'):
+                return ip
     except Exception:
         pass
-    return warn("已禁用")
+    return None
 
 
 def get_dns_servers():
@@ -261,22 +265,19 @@ def get_ip_risk(ip):
         itype = data.get("type", "")
         proxy = data.get("proxy", "")
         parts = []
+        score = None
         if risk is not None:
             score = int(risk)
-            if score < 30:
-                color, level = C.GREEN, "低风险"
-            elif score < 70:
-                color, level = C.YELLOW, "中风险"
-            else:
-                color, level = C.RED, "高风险"
+            color, level = risk_color(score)
             parts.append(f"{color}{score}/100 {level}{C.RESET}")
         if itype:
             parts.append(f"类型 {itype}")
         if proxy == "yes":
             parts.append(bad("已标记为代理"))
-        return "  ".join(parts) if parts else warn("暂无数据")
+        display = "  ".join(parts) if parts else warn("暂无数据")
+        return display, score
     except Exception as e:
-        return warn(f"查询失败（{e}）")
+        return warn(f"查询失败（{e}）"), None
 
 
 def get_stopforumspam(ip):
@@ -292,12 +293,7 @@ def get_stopforumspam(ip):
         confidence = float(data.get("confidence", 0))
         frequency  = int(data.get("frequency", 0))
         last_seen  = (data.get("lastseen") or "")[:10]
-        if confidence < 30:
-            color, level = C.GREEN, "低风险"
-        elif confidence < 70:
-            color, level = C.YELLOW, "中风险"
-        else:
-            color, level = C.RED, "高风险"
+        color, level = risk_color(confidence)
         lines = [f"{color}{confidence:.1f}/100 {level}{C.RESET}  举报 {frequency} 次"]
         if last_seen:
             lines.append(f"最近举报 {last_seen}")
@@ -353,6 +349,7 @@ def main():
         return
 
     pub = get_public_info()
+    pub_ok = pub.get("status") == "success"
 
     print(f"\n  {C.BOLD}ipcheck — 网络环境诊断工具{C.RESET}  "
           f"{C.GRAY}({platform.system()} / Python {platform.python_version()}){C.RESET}\n")
@@ -360,7 +357,9 @@ def main():
 
     # 本机网络
     tbl_row("局域网 IP", get_lan_ip())
-    tbl_row("IPv6 地址", get_ipv6())
+    ipv6_addr = get_ipv6()
+    ipv6_leaked = ipv6_addr is not None
+    tbl_row("IPv6 地址", ipv6_addr if ipv6_leaked else warn("已禁用"))
     dns = get_dns_servers()
     if dns:
         tbl_row("DNS 服务器", dns_label(dns[0]))
@@ -368,11 +367,12 @@ def main():
             tbl_row("", dns_label(d))
     else:
         tbl_row("DNS 服务器", warn("获取失败"))
+    dns_cn = any("(CN)" in KNOWN_DNS.get(d, "") for d in dns)
 
     tbl_sep()
 
     # 公网信息
-    if pub.get("status") == "success":
+    if pub_ok:
         pub_ip = pub.get("query")
         tbl_row("公网 IP",          pub_ip or bad("获取失败"))
         tbl_row("国家 / 省份",      f"{_val(pub.get('country'))} / {_val(pub.get('regionName'))}")
@@ -395,17 +395,19 @@ def main():
     tbl_sep()
 
     # 代理检测
+    risk_score = None
     proxy_envs = get_proxy_envs()
     if proxy_envs:
         for k, v in proxy_envs.items():
             tbl_row(k, warn(v))
     else:
         tbl_row("环境变量代理", ok("未设置"))
-    if pub.get("status") == "success":
+    if pub_ok:
         tbl_row("IP 标记为代理", bad("是 ✗") if pub.get("proxy")   else ok("否 ✓"))
         tbl_row("机房 / 托管",   bad("是 ✗") if pub.get("hosting") else ok("否 ✓"))
         if (pub.get("hosting") or pub.get("proxy")) and pub_ip:
-            tbl_row("IP 风险查询",  get_ip_risk(pub_ip))
+            risk_display, risk_score = get_ip_risk(pub_ip)
+            tbl_row("IP 风险查询",  risk_display)
             spam_lines = get_stopforumspam(pub_ip)
             tbl_row("垃圾滥用记录", spam_lines[0])
             for line in spam_lines[1:]:
@@ -414,26 +416,73 @@ def main():
     tbl_sep()
 
     # 时区
+    tz_matched = None
     cli_dt     = datetime.datetime.now().astimezone()
     cli_offset = cli_dt.utcoffset()
     tz_name, is_iana = get_cli_tz_name()
     tbl_row("CLI 时区", f"{tz_name}  ({_utc_str(cli_offset)})")
 
-    pub_tz_name = pub.get("timezone") if pub.get("status") == "success" else None
+    pub_tz_name = pub.get("timezone") if pub_ok else None
     if pub_tz_name:
         pub_zi     = make_zone(pub_tz_name)
         pub_offset = datetime.datetime.now(pub_zi).utcoffset() if pub_zi else None
 
         if is_iana:
-            match = ok("一致 ✓") if tz_name == pub_tz_name else bad("不一致 ✗")
+            tz_matched = tz_name == pub_tz_name
+            match = ok("一致 ✓") if tz_matched else bad("不一致 ✗")
         elif pub_offset is not None:
-            if cli_offset == pub_offset:
+            tz_matched = cli_offset == pub_offset
+            if tz_matched:
                 match = warn("UTC 偏移一致（建议设置 $TZ=IANA 名称精确比对）")
             else:
                 match = bad("不一致 ✗（UTC 偏移不同）")
         else:
             match = warn("无法比对（tzdata 未安装？pip install tzdata）")
         tbl_row("时区一致性", match)
+
+    tbl_sep()
+    conclusions = []
+    if ipv6_leaked:
+        conclusions.append(bad("✗ IPv6 泄露，暴露真实地址"))
+    else:
+        conclusions.append(ok("✓ IPv6 已禁用，无泄露风险"))
+    if dns_cn:
+        conclusions.append(bad("✗ DNS 使用国内服务商，暴露真实位置"))
+    elif not dns:
+        conclusions.append(warn("- DNS 获取失败，无法评估"))
+    else:
+        conclusions.append(ok("✓ DNS 未检测到国内服务商"))
+    if not pub_ok:
+        conclusions.append(warn("- IP 信息获取失败，无法评估风险"))
+    elif pub.get("proxy") or pub.get("hosting"):
+        if risk_score is not None:
+            if risk_score < 30:
+                conclusions.append(ok(f"✓ IP 风险低（{risk_score}/100）"))
+            elif risk_score < 70:
+                conclusions.append(warn(f"! IP 风险中等（{risk_score}/100），建议关注"))
+            else:
+                conclusions.append(bad(f"✗ IP 风险高（{risk_score}/100），建议更换节点"))
+        else:
+            conclusions.append(warn("! IP 为机房/代理，未查到风险分数"))
+    else:
+        conclusions.append(ok("✓ IP 正常，无风险标记"))
+    if tz_matched is True:
+        conclusions.append(ok("✓ 时区一致"))
+    elif tz_matched is False:
+        conclusions.append(bad("✗ 时区不一致，建议调整"))
+    else:
+        conclusions.append(warn("- 时区无法比对"))
+    has_bad = (ipv6_leaked or dns_cn
+               or (risk_score is not None and risk_score >= 70)
+               or tz_matched is False)
+    tbl_row("结论分析", conclusions[0])
+    for c in conclusions[1:]:
+        tbl_row("", c)
+    tbl_sep()
+    if has_bad:
+        tbl_row("综合结论", bad("⚠ 当前环境 Claude 使用高风险"))
+    else:
+        tbl_row("综合结论", ok("✓ 当前环境 Claude 使用低风险"))
 
     tbl_bot()
 
