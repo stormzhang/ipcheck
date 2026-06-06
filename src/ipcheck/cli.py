@@ -13,6 +13,8 @@ import subprocess
 import datetime
 import re
 import platform
+import random
+import concurrent.futures
 
 import requests
 
@@ -136,6 +138,29 @@ def display_len(s):
     return sum(char_width(c) for c in ANSI_RE.sub('', s))
 
 
+def clip(s, width):
+    """按显示宽度裁剪字符串，保留 ANSI 颜色码，超出部分用省略号代替。
+    保证表格值不会撑破右边框。"""
+    if display_len(s) <= width:
+        return s
+    out, used, has_ansi = [], 0, False
+    for m in re.finditer(r'(\033\[[0-9;]*m)|(.)', s):
+        if m.group(1):
+            out.append(m.group(1))
+            has_ansi = True
+            continue
+        ch = m.group(2)
+        w = char_width(ch)
+        if used + w > width - 1:        # 预留 1 格给省略号
+            break
+        out.append(ch)
+        used += w
+    out.append('…')
+    if has_ansi:
+        out.append(C.RESET)
+    return ''.join(out)
+
+
 def ok(v):   return f"{C.GREEN}{v}{C.RESET}"
 def warn(v): return f"{C.YELLOW}{v}{C.RESET}"
 def bad(v):  return f"{C.RED}{v}{C.RESET}"
@@ -158,7 +183,7 @@ def tbl_bot(): print(f"  ╚{'═'*(COL_LABEL+2)}╧{'═'*(COL_VALUE+2)}╝")
 
 
 def tbl_row(label, value):
-    value = str(value)
+    value = clip(str(value), COL_VALUE)
     lpad = ' ' * max(0, COL_LABEL - display_len(label))
     vpad = ' ' * max(0, COL_VALUE - display_len(value))
     lstr = f"{label}{lpad}" if label else ' ' * COL_LABEL
@@ -427,6 +452,164 @@ def get_cli_tz_name():
     return name, False
 
 
+# ── 真实 DNS 出口测试（bash.ws 随机子域名法）────────────────
+# 原理：解析 N 个唯一子域名 → 强制递归 resolver 去访问 bash.ws 权威服务器
+# （不命中缓存），权威端记录"实际是哪些 resolver IP 来查的"，即 DNS 真实出口。
+# 比静态读 /etc/resolv.conf 更可信：能抓出代理接管后的真实解析路径，
+# 也能识别未在 KNOWN_DNS 表内的国内 DNS。
+LEAK_LOOKUP_COUNT = 6
+LEAK_HTTP_TIMEOUT = 5
+LEAK_RETRIES = 2          # 异常 / 超时 / 无数据后自动重试次数
+
+
+def _is_cn_country(name):
+    if not name:
+        return False
+    s = str(name).strip().upper()
+    return "CHINA" in s or s == "CN"
+
+
+def detect_proxy_url():
+    """从环境变量或 macOS 系统代理推断一个可用的代理地址，供代理路径测试用。"""
+    for key in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                "ALL_PROXY", "all_proxy"):
+        val = os.environ.get(key)
+        if val:
+            return val
+    for item in (get_system_proxy() or []):
+        m = re.search(r'(\d{1,3}(?:\.\d{1,3}){3}):(\d+)', item)
+        if m:
+            return f"http://{m.group(1)}:{m.group(2)}"
+    return None
+
+
+def _bashws_result(test_id):
+    """查询 bash.ws 记录的、实际发起解析的 resolver 列表。失败返回 None。"""
+    try:
+        resp = requests.get(
+            f"https://bash.ws/dnsleak/test/{test_id}?json", timeout=8,
+        )
+        data = resp.json()
+    except Exception:
+        return None
+    uniq = {}
+    for d in data:
+        if d.get("type") != "dns":
+            continue
+        ip = d.get("ip", "")
+        country = (d.get("country_name") or d.get("country")
+                   or d.get("country_iso") or "")
+        uniq[ip] = {"ip": ip, "country": country, "asn": d.get("asn", "")}
+    return list(uniq.values())
+
+
+def _trigger_direct(test_id):
+    """直连/OS 路径：用系统 resolver 解析唯一子域名。"""
+    hosts = [f"{i}.{test_id}.bash.ws" for i in range(1, LEAK_LOOKUP_COUNT + 1)]
+
+    def _resolve(h):
+        try:
+            socket.gethostbyname(h)
+        except OSError:
+            pass
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=LEAK_LOOKUP_COUNT) as ex:
+        list(ex.map(_resolve, hosts))
+
+
+def _trigger_proxy(test_id, proxy_url):
+    """代理路径（Claude 实际走的）：经代理请求唯一子域名，让解析在出口节点发生。"""
+    hosts = [f"{i}.{test_id}.bash.ws" for i in range(1, LEAK_LOOKUP_COUNT + 1)]
+    proxies = {"http": proxy_url, "https": proxy_url}
+
+    def _fetch(h):
+        try:
+            requests.get(f"http://{h}", proxies=proxies,
+                         timeout=LEAK_HTTP_TIMEOUT)
+        except Exception:
+            pass
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=LEAK_LOOKUP_COUNT) as ex:
+        list(ex.map(_fetch, hosts))
+
+
+def _run_leak_path(trigger):
+    """跑一条 DNS 出口路径；异常 / 超时 / 无数据时换新 id 自动重试。
+    返回 resolver 列表；全部尝试失败返回 None，权威端无记录返回 []。"""
+    last = None
+    for _ in range(LEAK_RETRIES + 1):
+        tid = random.randint(1_000_000, 9_999_999)
+        try:
+            trigger(tid)
+            servers = _bashws_result(tid)
+        except Exception:
+            servers = None
+        if servers:                 # 拿到非空结果才算成功
+            return servers
+        last = servers              # None（失败）或 []（无记录）
+    return last
+
+
+def dns_leak_test(proxy_url=None):
+    """返回 {'direct': [...]|None, 'proxy': [...]|None}，元素含 ip/country/asn。"""
+    result = {"direct": None, "proxy": None}
+    result["direct"] = _run_leak_path(_trigger_direct)
+    if proxy_url:
+        result["proxy"] = _run_leak_path(
+            lambda tid: _trigger_proxy(tid, proxy_url))
+    return result
+
+
+# ── AI 域名隧道探针（测路由可达性，DNS 出口测试的补充）─────────
+# 解析主流国外 AI 域名，测"解析到的 IP 是否经代理隧道可达"。
+# 与 DNS 出口测试互补：出口测试看"解析从哪走"，这里看"连接往哪走"。
+# 若本地 DNS 被污染、解析出假 IP，隧道 CONNECT 会失败，可暴露污染。
+AI_PROBE_DOMAINS = [
+    "anthropic.com", "api.anthropic.com", "claude.ai",
+    "openai.com", "api.openai.com", "chatgpt.com",
+    "gemini.google.com", "x.ai", "perplexity.ai", "huggingface.co",
+]
+AI_CORE_DOMAINS = {"anthropic.com", "api.anthropic.com", "claude.ai"}
+PROBE_TIMEOUT = 5
+
+
+def _proxy_host_port(proxy_url):
+    m = re.search(r'(?:.*@)?([\w.\-]+):(\d+)', proxy_url or "")
+    return (m.group(1), int(m.group(2))) if m else None
+
+
+def _tunnel_reachable(hp, target_ip, port=443, timeout=PROBE_TIMEOUT):
+    """经 HTTP 代理 CONNECT 到 target_ip:port，判断是否经隧道可达。"""
+    host, pport = hp
+    try:
+        with socket.create_connection((host, pport), timeout=timeout) as s:
+            s.settimeout(timeout)
+            s.sendall(f"CONNECT {target_ip}:{port} HTTP/1.1\r\n"
+                      f"Host: {target_ip}:{port}\r\n\r\n".encode())
+            status_line = s.recv(128).split(b"\r\n", 1)[0]
+            return b" 200" in status_line
+    except Exception:
+        return False
+
+
+def ai_domain_probe(proxy_url):
+    """返回 [{'domain','ip','reachable'}]；无可用代理返回 None。"""
+    hp = _proxy_host_port(proxy_url)
+    if not hp:
+        return None
+
+    def _probe(domain):
+        try:
+            ip = socket.gethostbyname(domain)
+        except OSError:
+            return {"domain": domain, "ip": None, "reachable": None}
+        return {"domain": domain, "ip": ip,
+                "reachable": _tunnel_reachable(hp, ip)}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        return list(ex.map(_probe, AI_PROBE_DOMAINS))
+
+
 # ── 主程序 ────────────────────────────────────────────────
 def main():
     if len(sys.argv) > 1 and sys.argv[1] in ('--version', '-v', '-V'):
@@ -434,8 +617,20 @@ def main():
         print(f"ipcheck {__version__}")
         return
 
+    leak_enabled = not any(a in ('--no-leak', '--fast') for a in sys.argv[1:])
+
     pub = get_public_info()
     pub_ok = pub.get("status") == "success"
+
+    leak = {"direct": None, "proxy": None}
+    probe = None
+    if leak_enabled:
+        proxy_url = detect_proxy_url()
+        print(f"  {C.GRAY}正在进行真实 DNS 出口测试…       {C.RESET}", end="\r", flush=True)
+        leak = dns_leak_test(proxy_url)
+        print(f"  {C.GRAY}正在探测 AI 域名隧道可达性…      {C.RESET}", end="\r", flush=True)
+        probe = ai_domain_probe(proxy_url)
+        print(" " * 50, end="\r")  # 清掉提示行
 
     print(f"\n  {C.BOLD}ipcheck — 网络环境诊断工具{C.RESET}  "
           f"{C.GRAY}({platform.system()} / Python {platform.python_version()}){C.RESET}\n")
@@ -454,6 +649,70 @@ def main():
     else:
         tbl_row("DNS 服务器", warn("获取失败"))
     dns_cn = any("(CN)" in KNOWN_DNS.get(d, "") for d in dns)
+
+    # 真实 DNS 出口测试结果（以此为准，上面的静态表仅作标注）
+    leak_available = (leak.get("direct") is not None
+                      or leak.get("proxy") is not None)
+    pub_country = pub.get("country") if pub_ok else None
+
+    def _country_eq(a, b):
+        if not a or not b:
+            return False
+        alias = {"us": "united states", "usa": "united states",
+                 "uk": "united kingdom", "hk": "hong kong",
+                 "tw": "taiwan", "cn": "china"}
+        na, nb = a.strip().lower(), b.strip().lower()
+        return alias.get(na, na) == alias.get(nb, nb)
+
+    def _render_exit(servers, label):
+        if servers is None:
+            tbl_row(label, warn("测试失败 / 超时"))
+            return []
+        if not servers:
+            tbl_row(label, warn("无数据"))
+            return []
+        countries, first = [], True
+        for s in servers:
+            cc = s["country"] or "未知"
+            countries.append(s["country"])
+            txt = f"{s['ip']}  {cc}"
+            if s["asn"]:
+                txt += f"  {s['asn']}"
+            tbl_row(label if first else "", bad(txt) if _is_cn_country(cc) else txt)
+            first = False
+        return countries
+
+    dns_exit_cn = False
+    dns_exit_consistent = None
+    if leak_enabled:
+        direct_cc = _render_exit(leak.get("direct"), "通用DNS出口(直连)")
+        proxy_cc = (_render_exit(leak.get("proxy"), "通用DNS出口(代理)")
+                    if leak.get("proxy") is not None else [])
+        # Claude 走代理路径；无代理时退回直连路径判断
+        claude_cc = proxy_cc if leak.get("proxy") is not None else direct_cc
+        dns_exit_cn = any(_is_cn_country(c) for c in claude_cc)
+        if pub_country and claude_cc:
+            dns_exit_consistent = all(_country_eq(c, pub_country) for c in claude_cc)
+            if dns_exit_cn:
+                verdict = bad("DNS 出口含中国 ✗，真实位置泄露")
+            elif dns_exit_consistent:
+                verdict = ok(f"一致 ✓（均为 {pub_country}）")
+            else:
+                verdict = warn(f"出口地与 IP({pub_country}) 不一致，留意")
+            tbl_row("DNS 出口一致性", verdict)
+
+    # AI 域名隧道探针（路由可达性，补充信号）
+    probe_core_bad = False
+    if probe is not None:
+        ok_n = sum(1 for p in probe if p["reachable"])
+        tbl_row("AI 域名隧道探针", f"{ok_n}/{len(probe)} 经隧道可达")
+        for p in probe:
+            ip = p["ip"] or "解析失败"
+            mark = ok("✓") if p["reachable"] else (
+                warn("?") if p["reachable"] is None else bad("✗"))
+            tbl_row("", f"{mark} {p['domain']}  {ip}")
+        probe_core_bad = any(
+            p["domain"] in AI_CORE_DOMAINS and not p["reachable"] for p in probe)
 
     tbl_sep()
 
@@ -550,12 +809,29 @@ def main():
         conclusions.append(bad("✗ IPv6 泄露，暴露真实地址"))
     else:
         conclusions.append(ok("✓ IPv6 已禁用，无泄露风险"))
-    if dns_cn:
-        conclusions.append(warn("! DNS 使用国内服务商，可能暴露真实位置"))
+    if leak_enabled and leak_available:
+        if dns_exit_cn:
+            conclusions.append(warn("! 通用DNS出口含中国，非白名单流量暴露真实位置"))
+        elif dns_exit_consistent is False:
+            conclusions.append(warn("! 通用DNS出口地与公网 IP 不一致，建议核查"))
+        else:
+            conclusions.append(ok("✓ 通用DNS出口正常，未泄露"))
+        if dns_cn and not dns_exit_cn:
+            conclusions.append(ok("✓ 本机虽配国内 DNS，但实际解析未走它（代理已接管）"))
+    elif dns_cn:
+        conclusions.append(warn("! DNS 配置含国内服务商，可能暴露真实位置（未做出口测试）"))
     elif not dns:
         conclusions.append(warn("- DNS 获取失败，无法评估"))
     else:
-        conclusions.append(ok("✓ DNS 未检测到国内服务商"))
+        conclusions.append(ok("✓ DNS 配置未检测到国内服务商"))
+    if probe is not None:
+        unreachable = [p["domain"] for p in probe if not p["reachable"]]
+        if probe_core_bad:
+            conclusions.append(bad("✗ Claude 核心域名隧道不可达，路由 / DNS 污染异常"))
+        elif unreachable:
+            conclusions.append(warn(f"! {len(unreachable)} 个 AI 域名隧道不可达（{unreachable[0]} 等）"))
+        else:
+            conclusions.append(ok("✓ AI 域名均经隧道可达，路由正常"))
     if not pub_ok:
         conclusions.append(warn("- IP 信息获取失败，无法评估风险"))
     elif pub.get("proxy") or pub.get("hosting"):
@@ -576,20 +852,34 @@ def main():
         conclusions.append(bad("✗ 时区不一致，建议调整"))
     else:
         conclusions.append(warn("- 时区无法比对"))
-    has_bad = (ipv6_leaked
-               or (risk_score is not None and risk_score >= 70)
-               or tz_matched is False)
+    # Claude 专用风险：只看 Claude 实际路径承受的信号
+    # （IPv6 / 出口 IP 信誉 / 时区一致性 / Claude 核心域名隧道可达性）
+    claude_bad = (ipv6_leaked
+                  or probe_core_bad
+                  or (risk_score is not None and risk_score >= 70)
+                  or tz_matched is False)
+    # 通用环境风险：影响非白名单流量的卫生问题（通用 DNS 出口、其他 AI 域名不可达）
+    env_bad = dns_exit_cn or (probe is not None and any(
+        not p["reachable"] and p["domain"] not in AI_CORE_DOMAINS for p in probe))
+    if not (leak_enabled and leak_available):
+        env_bad = env_bad or dns_cn       # 未做出口测试时回退到静态判断
+
     tbl_row("结论分析", conclusions[0])
     for c in conclusions[1:]:
         tbl_row("", c)
     tbl_sep()
-    if has_bad:
-        tbl_row("综合结论", bad("⚠ 当前环境 Claude 使用高风险"))
-    else:
-        tbl_row("综合结论", ok("✓ 当前环境 Claude 使用低风险"))
+    tbl_row("Claude 专用风险",
+            bad("⚠ 高风险，建议处理") if claude_bad else ok("✓ 低风险，可放心使用"))
+    tbl_row("通用环境风险",
+            bad("⚠ 高风险（影响非白名单流量）") if env_bad else ok("✓ 低风险"))
 
     tbl_bot()
 
+    if leak_enabled and leak_available:
+        print(f"\n  {C.GRAY}注：「通用DNS出口」测的是非白名单域名(bash.ws)的真实解析出口，"
+              f"反映默认 DNS 路径；{C.RESET}")
+        print(f"  {C.GRAY}　 Claude 等白名单 AI 域名走专属 DoH，其路由可达性以"
+              f"「AI 域名隧道探针」为准。{C.RESET}")
     if IS_WIN and _ZI is None:
         print(f"\n  {C.YELLOW}提示：pip install tzdata  （Windows 时区精确比对所需）{C.RESET}")
     if IS_WIN and not _COLOR:
