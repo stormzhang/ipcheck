@@ -1,16 +1,19 @@
 # ip-check ROADMAP
 
 > 本项目真实进度源,记录当前阶段、已完成、进行中、待办、阻塞、最近验证。
-> 最后更新:2026-07-01
+> 最后更新:2026-07-29
 
 ## 当前阶段
 
-已发布的命令行工具 `ipcheck`(PyPI 包名 `ai-ipcheck`),单模块 CLI,**已发布版本 0.3.1**(2026-07-02,PyPI 已上线 https://pypi.org/project/ai-ipcheck/0.3.1/ )。0.3.0 起做了主面板大改(字段语义重构 + 新增 Claude 检测块 + 综合结论三档风险 + 渲染修对齐/窄终端自适应),0.3.1 补了环境变量代理开关式展示 + 「检测建议」改名 + 综合结论单独成块(详见「最近验证」)。**版本号 commit 与 ROADMAP 记录尚未 push 到 origin**。同日另有附属独立脚本 `claude_expose_check.py`(Claude Code 暴露自检):因反蒸馏水印已在 2.1.198 移除,「水印自检 / 文本反向检测」两块已失效,**决定暂保留该文件**(不删不并入),主要留「遥测状态 / 服务端可见参数 / 敏感信息暴露」三块之后可能有用的逻辑,已在文件头和 CLAUDE.md 备注状态。当前重心:主面板改动待提交/发版、完善公开文档。字段语义以 `CLAUDE.md`「面板结构与字段语义」为准。
+已发布的命令行工具 `ipcheck`(PyPI 包名 `ai-ipcheck`),**已发布版本 0.3.1**(2026-07-02,PyPI 已上线 https://pypi.org/project/ai-ipcheck/0.3.1/ )。**2026-07-29 新完成(未提交/未发版):移植 claude-check 项目的本地环境检测为 `src/ipcheck/local.py` 子模块**,新增 `ipcheck --local`(只跑本地)/ `--full`(网络+本地+换号就绪度合并结论)/ `--deep` / `--reveal`,本地有 fail 时退出码 1;配套 `tests/test_local.py`(20 项)与中英 README、CLAUDE.md ⑦ 更新。版本号未动,是否随下次发版升号待主人确认。此前阶段:0.3.0 起主面板大改,0.3.1 补代理开关式展示 + 「检测建议」改名 + 综合结论单独成块;**0.3.1 的版本号 commit 与 ROADMAP 记录尚未 push 到 origin**。附属独立脚本 `claude_expose_check.py` 仍暂保留(不删不并入),详见其文件头与 CLAUDE.md。字段语义以 `CLAUDE.md`「面板结构与字段语义」为准。
 
 ## 已完成(已实现且已验证)
 
 > 说明:已发布到 PyPI 且 README 配有运行截图(`screenshot.png`),核心命令可运行可视为已验证;但仓库内未见自动化测试或运行日志沉淀,以下条目以「已发布 + 截图证据」为依据。
 
+- **本地环境检测模块 `src/ipcheck/local.py`**(2026-07-29,移植自 claude-check 项目的 `claude-check.py`,纯标准库):账号标识自动收集(`~/.claude.json` 当前基准 + backups 滚动备份历史账号 + telemetry JSONL 递归提取,按 accountUuid/邮箱合并,历史残留→fail)、.claude 目录三类分类、shell 配置 claude|anthropic 行、Chrome Cookies(macOS,sqlite3 immutable=1)、钥匙串 OAuth 凭证(macOS)、ps 进程、`which claude`、npm 全局包、安装残留目录、`--deep` 深扫会话记录(历史邮箱/UUID 为 needle,10MB 上限)、`--reveal` 明文切换(默认 `mask()` 打码)。渲染复用 cli.py tbl_* 表格风格;跨平台降级:macOS 专属项在非 macOS 报 info「未覆盖」
+- **CLI 新参数 + 退出码**(2026-07-29):`ipcheck --local`(只本地)/ `--full`(网络+本地,末尾「换号就绪度」合并结论:本地 fail 或网络高风险→不建议换号)/ `--deep` / `--reveal`(单独用时隐含 --local)/ `--help`;本地有 fail 退出码 1,`__main__.py` 改 `raise SystemExit(main())`;`cli.py` 拆出 `run_network_report()` 返回 has_bad/has_mid 信号
+- **`tests/test_local.py`**(2026-07-29,20 项):mask、递归提取、标识合并(sources 并集/is_current 黏性/邮箱兜底 key)、历史/当前判定、遥测队列 JSONL 解析、deep_needles 选择、深扫命中/跳过/干净、shell 配置三态;全部用 TemporaryDirectory 注入 home,不碰真实 home、不触发 subprocess 检测项
 - 单模块 CLI 工具落地:`src/ipcheck/cli.py` 集中全部逻辑,`pyproject.toml` 注册 `ipcheck` 命令,`python -m ipcheck` 入口可用
 - 已发布到 PyPI:包名 `ai-ipcheck`(`ipcheck` 被占),CLI 命令名 `ipcheck`,版本号到 **0.3.1**
 - 公网信息检测:经 ip-api.com 获取出口 IP、国家/省份/城市、ISP、组织、代理/托管标记、公网时区
@@ -35,7 +38,7 @@
 - `claude_expose_check.py` 是否并入主命令做 `ipcheck claude` 子命令(复用 `tbl_*` 表格渲染 + `IS_WIN` 跨平台逻辑);若并入需同步升版本、改 README。待主人确认方向
 - `claude_expose_check.py` 二级兜底:当前二进制找不到时回退名单仅 `["cn"]`(域名匹配退化);可选嵌入 147+11 快照做兜底,便于「没装 Claude 也能用」,代价是快照会随版本过期。待主人确认是否需要
 - 完善 MCP 使用体验与公开文档(来自 projects.json 的 nextStep;注意:MCP server 已于 commit 16bf65f 移除并重构为纯 CLI,此 nextStep 与当前代码状态不一致,需主人确认方向是否仍要 MCP)
-- 测试现状待澄清:CLAUDE.md 写「无测试」,但仓库存在 `tests/` 目录(mtime 2026-05-22),README 给出 `PYTHONPATH=src python -m unittest discover -s tests`;需确认测试是否真实存在并能跑通
+- ~~测试现状待澄清~~(2026-07-29 已澄清):`tests/` 真实存在且能跑通——`test_cli.py` 7 项 + 新增 `test_local.py` 20 项,`PYTHONPATH=src python3 -m unittest discover -s tests` 27 项全过;CLAUDE.md 原「无测试」表述已同步修正
 - 非 macOS 平台的系统代理检测(当前 `get_system_proxy()` 仅 macOS 实现,其他平台不判断)
 
 ## 阻塞
@@ -44,6 +47,7 @@
 
 ## 最近验证
 
+- 2026-07-29 — **本地环境检测模块落地(未提交/未发版)**:`PYTHONPATH=src python3 -m unittest discover -s tests` 27 项全过(原 7 项 + 新 20 项);本机 macOS 实跑 `python3 -m ipcheck --local` 正常出报告、退出码 1(真实 fail:5 个滚动备份 + 历史账号标识、claude 命令仍存在;warn:27 条 Chrome cookie、2 个 claude 进程、2 处安装残留);`--full` 网络+本地+换号就绪度合并结论(判「不建议换号」)正常;默认 `ipcheck` 网络面板输出不变、退出码 0;`--deep` 实跑扫描 7 个会话文件未发现历史标识;`--help` / `--version` 正常。字段语义已写入 CLAUDE.md ⑦
 - 2026-07-02 — **发布 0.3.1 到 PyPI**：版本号两处同步升 0.3.0 → 0.3.1，`python -m build` 打包 + `twine check` 双产物 PASSED + `twine upload` 上线，`/pypi/ai-ipcheck/0.3.1/json` 返回 HTTP 200、版本 0.3.1、whl + tar.gz 均在。本次含环境变量代理开关式展示、「检测建议」改名 + 综合结论单独成块。https://pypi.org/project/ai-ipcheck/0.3.1/ 。git 已提交至版本号 commit，**尚未 push 到 origin**
 - 2026-07-02 — **「结论和建议」改名「检测建议」+ 综合结论单独成块**：label 由「结论和建议」改为「检测建议」；在检测建议与综合结论之间加 `tbl_sep()`，综合结论单独成一块（原为同块无分隔线）。mock 面板验证通过。字段语义已同步 CLAUDE.md ⑥
 - 2026-07-02 — **环境变量代理展示统一**：原逻辑设了代理就逐行列出变量名 + 代理地址（暴露 `127.0.0.1:7890` 端口，且与系统代理/TUN 的开关式展示不一致），改为固定一行「已设置（绿）/ 未设置（黄）」，三个代理项展示彻底统一、不再泄露地址，兑现 CLAUDE.md ③「只显示开关状态、三项统一」。mock 面板验证通过

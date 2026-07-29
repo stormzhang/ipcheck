@@ -1,6 +1,6 @@
 # ipcheck
 
-A lightweight diagnostic tool for AI developers to verify network environment compatibility and IP reputation.
+A lightweight diagnostic tool for AI developers to verify network environment compatibility and IP reputation. Ships with a local environment check (`--local`): before switching Claude accounts, confirm that identity traces of previous accounts have been cleaned up, so the new account won't get banned by association.
 
 [中文](./README.md)
 
@@ -29,6 +29,8 @@ To ensure AI tools like Claude Code, OpenAI API, and Cursor run smoothly and rel
 | IP Type & Risk | Datacenter/residential detection, proxycheck.io risk score, StopForumSpam abuse records, whether flagged as proxy |
 | Timezone Consistency | System timezone and CLI timezone (all IANA), compared against the exit IP timezone for both CC CLI (honors `$TZ`) and the desktop app (uses system timezone) |
 | Claude Endpoint Check | Detects whether the Claude Code endpoint is official-direct / a domestic LLM / a third-party relay; relays are flagged for data-leak and ban risk and matched against a known-endpoint blacklist |
+| Local Environment Check (`--local`) | Anti-association check before switching accounts: collects local Claude identity residue (`.claude.json` / rolling backups / telemetry retry queue), shell configs, Chrome Cookies, keychain credentials, processes and install leftovers; sensitive values are masked by default |
+| Switch Readiness (`--full`) | Runs both network and local checks, then gives a merged verdict: local high-risk residue or high network risk → do not switch yet |
 | Overall Verdict | Aggregates all checks into a one-line assessment: high / medium / low risk for running Claude |
 
 ## Install
@@ -40,8 +42,14 @@ pip install ai-ipcheck
 ## Usage
 
 ```bash
-ipcheck
+ipcheck                  # Network diagnostics (default)
+ipcheck --local          # Local environment check (anti-association for account switching; read-only, zero upload)
+ipcheck --full           # Network + local, with a merged switch-readiness verdict at the end
+ipcheck --deep           # Also deep-scan session logs for historical identity text (implies --local)
+ipcheck --reveal         # Show sensitive values in plaintext (masked by default; implies --local)
 ```
+
+Exit code: `1` when the local check finds high-risk residue (fail), otherwise `0` — suitable for scripting.
 
 ### Requirements
 
@@ -63,6 +71,10 @@ ipcheck
 **Claude Endpoint Check** — Reads Claude Code's `ANTHROPIC_BASE_URL` to determine whether it is official-direct, a domestic LLM (does not go through Anthropic, no ban risk), or a third-party relay (flagged as "suspected relay, watch for data leakage"), and matches it against a known-endpoint blacklist — a hit raises the overall risk.
 
 **Overall Verdict** — At the end of the report, in its own block, `ipcheck` aggregates all checks into a single bottom line: whether your current environment is low / medium / high risk for running Claude. Check this line before launching Claude.
+
+**Local Environment Check (`--local`)** — An anti-association self-check for account switching; purely local, read-only, zero upload. It collects account identity traces automatically: `~/.claude.json` serves as the current-account baseline, while historical accounts are identified from rolling backups under `~/.claude/backups/` and the telemetry retry queue under `~/.claude/telemetry/` (these two are the main channels of association bans). It also checks `claude`/`anthropic` lines in shell configs, Chrome Cookies (macOS only), keychain OAuth credentials (macOS only), running claude processes, the `claude` command and npm global packages, and install leftover directories. `--deep` additionally scans session logs for historical email/UUID text. Historical residue is reported as fail and sets exit code 1. On non-macOS platforms, macOS-only items show as "not covered".
+
+**Switch Readiness (`--full`)** — After running both network and local checks, a merged verdict appears in its own block: local high-risk residue or high network risk → do not switch yet; only minor warnings → you may switch but should fix them first; all green → safe to switch.
 
 ## License
 

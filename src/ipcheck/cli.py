@@ -672,14 +672,77 @@ def blacklist_hit(host):
     return None
 
 
-# ── 主程序 ────────────────────────────────────────────────
-def main():
-    if len(sys.argv) > 1 and sys.argv[1] in ('--version', '-v', '-V'):
-        from ipcheck import __version__
-        print(f"ipcheck {__version__}")
-        return
+# ── 本地环境检测渲染（local.py）────────────────────────────
+def render_local_report(rep):
+    """把 local.LocalChecker 的结果渲染成 ipcheck 原生表格板块。"""
+    print(f"\n  {C.BOLD}本地环境检测（Claude 换号防关联）{C.RESET}  "
+          f"{C.GRAY}(纯本地只读，零上传 / {platform.system()}){C.RESET}\n")
+    tbl_top()
+    for r in rep.results:
+        if r.status == "pass":
+            v = ok(r.summary)
+        elif r.status == "info":
+            v = f"{C.GRAY}{r.summary}{C.RESET}"
+        elif r.status == "warn":
+            v = warn(f"! {r.summary}")
+        else:
+            v = bad(f"! {r.summary}")
+        tbl_row(r.label, v)
+        for d in r.details:
+            for line in str(d).splitlines():
+                tbl_row("", f"{C.GRAY}{line}{C.RESET}")
+    tbl_sep()
+    if rep.has_fail:
+        tbl_row("本地结论", bad("存在高危残留，清理后再换号"))
+    elif rep.has_warn:
+        tbl_row("本地结论", warn("无高危项，但有残留建议核对"))
+    else:
+        tbl_row("本地结论", ok("本地环境干净，可以安全切换账号"))
+    tbl_bot()
 
-    fit_width()
+
+def render_switch_verdict(rep, net):
+    """--full 的合并结论：本地有 fail 或网络高风险 → 不建议换号。"""
+    print(f"\n  {C.BOLD}换号就绪度（网络 + 本地合并结论）{C.RESET}\n")
+    tbl_top()
+    reasons = []
+    if rep.has_fail:
+        reasons.append(bad("! 本地检测存在高危残留（历史账号标识 / 凭证 / 遥测队列未清理）"))
+    elif rep.has_warn:
+        reasons.append(warn("! 本地有非高危残留，建议先核对"))
+    if net["has_bad"]:
+        reasons.append(bad("! 网络环境高风险（IP 风险分 ≥70 或中转命中 Anthropic 黑名单）"))
+    elif net["has_mid"]:
+        reasons.append(warn("! 网络环境中风险（时区不一致 / 节点有投诉 / 代理覆盖不完整）"))
+    if rep.has_fail or net["has_bad"]:
+        tbl_row("换号就绪度", bad("不建议换号，先处理上述红字项"))
+    elif rep.has_warn or net["has_mid"]:
+        tbl_row("换号就绪度", warn("可以换号，但建议先处理上述注意项"))
+    else:
+        tbl_row("换号就绪度", ok("网络与本地环境均就绪，可以安全换号"))
+    for r in reasons:
+        tbl_row("", r)
+    tbl_bot()
+
+
+# ── 主程序 ────────────────────────────────────────────────
+USAGE = """\
+ipcheck — 网络环境诊断工具
+
+用法:
+  ipcheck                  网络环境诊断（默认）
+  ipcheck --local          本地环境检测（Claude 换号防关联，纯本地只读）
+  ipcheck --full           网络 + 本地，末尾给出换号就绪度合并结论
+  ipcheck --deep           本地检测加深扫会话记录中的历史标识（隐含 --local）
+  ipcheck --reveal         敏感值显示明文（默认打码，隐含 --local）
+  ipcheck --version        显示版本
+
+退出码: 本地检测存在高危残留（fail）时为 1，否则为 0。
+"""
+
+
+def run_network_report():
+    """网络环境诊断面板（默认输出），返回综合结论信号。"""
     pub = get_public_info()
     pub_ok = pub.get("status") == "success"
 
@@ -856,3 +919,44 @@ def main():
     if IS_WIN and not _COLOR:
         print(f"\n  提示：pip install colorama  （启用彩色输出）")
     print()
+
+    return {"has_bad": has_bad, "has_mid": has_mid}
+
+
+def main():
+    argv = sys.argv[1:]
+    if argv and argv[0] in ('--version', '-v', '-V'):
+        from ipcheck import __version__
+        print(f"ipcheck {__version__}")
+        return 0
+    if argv and argv[0] in ('--help', '-h'):
+        print(USAGE)
+        return 0
+
+    local_only = '--local' in argv
+    full = '--full' in argv
+    deep = '--deep' in argv
+    reveal = '--reveal' in argv
+    # --deep / --reveal 只作用于本地检测，单独使用时隐含 --local
+    want_local = local_only or full or deep or reveal
+    want_net = not want_local or full
+
+    fit_width()
+
+    net = None
+    if want_net:
+        net = run_network_report()
+
+    rep = None
+    if want_local:
+        from ipcheck.local import run_local_checks
+        rep = run_local_checks(deep=deep, reveal=reveal)
+        render_local_report(rep)
+        print()
+
+    if full:
+        render_switch_verdict(rep, net)
+        print()
+
+    # 本地检测存在 fail → 非零退出码
+    return 1 if (rep and rep.has_fail) else 0

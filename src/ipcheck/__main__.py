@@ -1,3 +1,3 @@
 from ipcheck.cli import main
 
-main()
+raise SystemExit(main())
